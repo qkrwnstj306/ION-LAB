@@ -1,0 +1,35 @@
+# conda create --name StyleID python=3.8.5 -y
+# pip install -r requirements.txt
+# Python & PyTorch
+torch==1.11.0+cu113
+torchvision==0.12.0+cu113
+cudatoolkit==11.3
+
+# Numeric & Vision
+numpy==1.19.2
+opencv-python==4.1.2.30
+albumentations==0.4.3
+kornia==0.6
+imageio==2.9.0
+imageio-ffmpeg==0.4.2
+
+# ML / DL
+pytorch-lightning==1.4.2
+transformers==4.33.2
+einops==0.3.0
+torchmetrics==0.6.0
+torch-fidelity==0.3.0
+scikit-learn==1.1.1
+
+# Utilities
+lpips
+puDB==2019.2
+invisible-watermark
+omegaconf==2.1.1
+test-tube>=0.7.5
+streamlit==0.73.1
+requests==2.24.0
+
+# Editable installs
+#-e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
+#-e git+https://github.com/openai/CLIP.git@main#egg=clip

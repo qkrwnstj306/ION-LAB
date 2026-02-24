@@ -1,0 +1,5 @@
+precomputed_feats_k/
+
+models/ldm/stable-diffusion-v1/model.ckpt
+saved_qk/*.pkl
+saved_sim/*.pkl
