@@ -333,7 +333,7 @@ class CrossAttention(nn.Module):
         self.mask_cache[cache_key] = weight_maps
         return weight_maps
 
-    def _load_style_weight_maps_from_mask_files(self, mask_prefix, target_h, target_w, num_styles, device):
+    def _load_style_weight_maps_from_mask_files(self, mask_prefix, target_h, target_w, num_styles, device, allow_legacy_label_fallback=True):
         """
         `_mask0.npy`, `_mask1.npy`, ... `_mask{N-1}.npy` 파일을 읽어 style weight map stack을 생성합니다.
         반환 shape: (num_styles, h, w, 1)
@@ -341,6 +341,7 @@ class CrossAttention(nn.Module):
         해석 규칙:
         - 각 파일은 해당 style의 raw 마스크(0~1)입니다.
         - 겹침/비어있는 영역 처리는 apply_pi_mass_nway()에서 coverage + 정규화로 처리합니다.
+        - `allow_legacy_label_fallback=False`이면 `_mask.npy` fallback을 막고, 멀티 마스크 누락 시 즉시 에러를 냅니다.
         """
         cache_key = (
             f"multi_mask_weights::{mask_prefix}::{target_h}::{target_w}::{num_styles}::"
@@ -353,9 +354,9 @@ class CrossAttention(nn.Module):
         missing_paths = [p for p in mask_paths if not os.path.isfile(p)]
         if missing_paths:
             # 호환성 경로: 기존 label map(_mask.npy)가 남아 있으면 기존 로더를 사용합니다.
-            # 신규 운영은 멀티 마스크 파일 방식이 기본입니다.
+            # 단, N-style 멀티 마스크 규약을 명시적으로 사용하는 경우에는 silent fallback을 막기 위해 비활성화할 수 있습니다.
             legacy_label_path = f"{mask_prefix}.npy"
-            if os.path.isfile(legacy_label_path):
+            if allow_legacy_label_fallback and os.path.isfile(legacy_label_path):
                 weight_maps = self._load_style_weight_maps_from_label(
                     legacy_label_path,
                     target_h=target_h,
@@ -667,12 +668,26 @@ class CrossAttention(nn.Module):
             # N-style 신규 규약: content_001_mask0.npy, content_001_mask1.npy, ...
             mask_prefix = base_name + "_mask"
 
-            is_mask_exists = os.path.exists(mask_path)  # mask_path가 존재하는지 확인
+            is_mask_exists = os.path.exists(mask_path)  # legacy 단일 마스크(_mask.npy) 존재 여부
+            # N-style에서는 `_mask0.npy`, `_mask1.npy`, ... 존재 여부를 별도로 확인해야 합니다.
+            num_styles_cfg_for_mask_gate = None
+            has_explicit_num_styles_cfg_for_mask_gate = False
+            if injection_config is not None and ("num_styles" in injection_config):
+                has_explicit_num_styles_cfg_for_mask_gate = True
+                num_styles_cfg_for_mask_gate = int(injection_config.get("num_styles", 0))
+
+            is_nstyle_multimask_exists = False
+            if has_explicit_num_styles_cfg_for_mask_gate and num_styles_cfg_for_mask_gate is not None and num_styles_cfg_for_mask_gate > 0:
+                expected_multi_mask_paths = [
+                    f"{mask_prefix}{style_idx}.npy" for style_idx in range(num_styles_cfg_for_mask_gate)
+                ]
+                is_nstyle_multimask_exists = all(os.path.exists(p) for p in expected_multi_mask_paths)
             
             use_mask = (
                 self.cnt_name is not None
                 and not is_cross
-                and is_mask_exists
+                # 2-style legacy는 `_mask.npy`, N-style은 `_mask{i}.npy` 묶음으로 마스크 사용 여부를 판정합니다.
+                and (is_mask_exists or is_nstyle_multimask_exists)
             )
             
 
@@ -746,6 +761,9 @@ class CrossAttention(nn.Module):
                             target_w=layer_w,
                             num_styles=num_styles,
                             device=q.device,
+                            # N-style 경로에서는 멀티 마스크 파일 규약이 의도이므로,
+                            # `_mask.npy`로의 silent fallback을 막아 잘못된 전체 스타일 적용을 방지합니다.
+                            allow_legacy_label_fallback=False,
                         )
 
                         style_sims = self.apply_pi_mass_nway(
