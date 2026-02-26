@@ -774,6 +774,46 @@ class CrossAttention(nn.Module):
                         )
                       
                         cat_sim = torch.cat(style_sims + [cc_sim], 2)
+                        ### poly fit을 통한 tau 정하기
+                        H, Nq, Nk_cat = cat_sim.shape
+                        def log_pmax(logits, dim=-1):
+                            # logits: (..., N)
+                            max_logit, _ = logits.max(dim=dim, keepdim=True)
+                            lse = torch.logsumexp(logits, dim=dim, keepdim=True)
+                            return (max_logit - lse).squeeze(dim)
+                        logp_cc  = log_pmax(cc_sim)    # (H, Nq)
+                        logp_cat = log_pmax(cat_sim)   # (H, Nq)
+    
+                        # (H, Nq)
+                        delta = logp_cc - logp_cat   # head-wise per query
+
+                        # head별 하나의 delta로 만들기 (query 평균)
+                        delta_head = delta.mean(dim=1)   # (H,)
+
+                        # ----------------------------------------
+                        # polynomial tau (2nd order)
+                        # tau = a * Δ^2 + b * Δ + c
+                        # ----------------------------------------
+
+                        a1 = 0.08395199
+                        b2 = 0.43704639
+                        c3 = 1.00998177
+
+                        tau = a1 * delta_head**2 + b2 * delta_head + c3   # (H,)
+
+                        # 안정성 클램프 (optional but strongly recommended)
+                        tau = torch.clamp(tau, min=1.0, max=5.0) # tau가 1보다 작아지는 것을 방지
+                        # ----------------------------------------
+                        # head-wise temperature scaling
+                        # ----------------------------------------
+
+                        # (H, 1, 1)로 reshape해서 broadcasting
+                        tau = tau.view(H, 1, 1)
+
+                        cat_sim = tau * (cat_sim - cat_sim.mean(dim=-1, keepdim=True)) + cat_sim.mean(dim=-1, keepdim=True) # group-wise mean 유지
+                        
+                        cat_sim = cat_sim.softmax(dim=-1)
+                        ### poly fit을 통한 tau 정하기      
                         cat_v = torch.cat(style_v_branches[:num_styles] + [v_cnt], 1)
 
                         cat_sim = cat_sim.softmax(-1)
@@ -822,7 +862,7 @@ class CrossAttention(nn.Module):
                             attn_matrix_scale=attn_matrix_scale,
                             ch = 1.0,
                         )# Qcs Ks2 + a2
-
+                    
                         ### 26/01/01: pi_star 버전
                         pi_star = 0.9
                         # print(f"2-style은 기존것 그대로 구현중.")
