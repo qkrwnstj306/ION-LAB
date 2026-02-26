@@ -9,13 +9,11 @@ from einops import rearrange
 from pytorch_lightning import seed_everything
 from contextlib import nullcontext
 import copy
-import torchvision.transforms as transforms
 import pickle
 import time
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
-from dataset import TripleImageDataset, SingleImageDataset
 
 # # residual injection
 #from high_frequency_final import high_pass_filter
@@ -84,36 +82,31 @@ def get_resolution_scoped_precomputed_dir(base_dir, h, w):
     return os.path.join(base_dir, f"{h}x{w}")
 
 
-def center_crop_tensor_hw(x, target_h, target_w):
+def resize_tensor_hw(x, target_h, target_w, mode="bilinear"):
     """
-    4D tensor(B, C, H, W)를 target_h x target_w로 중앙 crop합니다.
-    dataset.py는 그대로 두고, 여기서 실행 해상도에 맞춰 최종 정렬합니다.
+    4D tensor(B, C, H, W)를 target_h x target_w로 resize합니다.
+    crop 대신 resize를 사용하여 전체 이미지를 유지합니다.
     """
     if x.ndim != 4:
-        raise ValueError(f"center_crop_tensor_hw는 4D tensor만 지원합니다. 현재 shape={tuple(x.shape)}")
-    _, _, h, w = x.shape
-    if target_h > h or target_w > w:
-        raise ValueError(
-            f"target crop 크기가 입력보다 큽니다. input=({h}, {w}), target=({target_h}, {target_w})"
-        )
-    top = (h - target_h) // 2
-    left = (w - target_w) // 2
-    return x[:, :, top:top + target_h, left:left + target_w]
+        raise ValueError(f"resize_tensor_hw는 4D tensor만 지원합니다. 현재 shape={tuple(x.shape)}")
+
+    if mode in {"bilinear", "bicubic", "trilinear", "linear"}:
+        return F.interpolate(x, size=(target_h, target_w), mode=mode, align_corners=False)
+    return F.interpolate(x, size=(target_h, target_w), mode=mode)
 
 
 def load_img(path, target_h=512, target_w=512):
     image = Image.open(path).convert("RGB")
     x, y = image.size
     print(f"Loaded input image of size ({x}, {y}) from {path}")
-    # 먼저 정사각형(max(H,W))으로 맞춘 뒤 중앙 crop으로 최종 직사각형을 만듦.
-    square_side = max(target_h, target_w)
-    image = transforms.CenterCrop(min(x, y))(image)
-    image = image.resize((square_side, square_side), resample=Image.Resampling.LANCZOS)
+    # crop 없이 최종 실행 해상도(H, W)로 바로 resize합니다.
+    # (이미지 전체 구도를 유지하고 크기만 변경하려는 정책)
+    image = image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
     image = 2. * image - 1.
-    image = center_crop_tensor_hw(image, target_h, target_w)
+    image = resize_tensor_hw(image, target_h, target_w, mode="bilinear")
     return image
 
 

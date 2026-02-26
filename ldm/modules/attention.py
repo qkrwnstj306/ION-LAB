@@ -185,37 +185,13 @@ class CrossAttention(nn.Module):
     def _load_and_preprocess_mask(self, mask_path, target_h, target_w, ch, device):
         """
         마스크 npy를 현재 attention 계층 해상도(target_h, target_w)에 맞게 변환합니다.
-        직사각형 입력 지원을 위해 다음 순서로 전처리합니다.
-        1) 정중앙 정사각 crop
-        2) (가능하면) base_latent 기준 정사각 resize 후 base_latent 직사각 crop
-        3) 현재 계층 해상도(target_h, target_w)로 resize
+        crop 없이 resize만 적용하여 전체 마스크 영역을 유지합니다.
         """
         mask = torch.tensor(np.load(mask_path), dtype=torch.float32, device=device)
         mask[mask < 0.5] = -1.0
         mask[mask > 0.5] = 1.0
         mask = mask * ch
         mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-        # attention에서도 동일하게 "정사각 중심 crop" 규칙을 맞춥니다.
-        h0, w0 = mask.shape[-2], mask.shape[-1]
-        side = min(h0, w0)
-        top = (h0 - side) // 2
-        left = (w0 - side) // 2
-        mask = mask[:, :, top:top + side, left:left + side]
-
-        base_hw = getattr(self, "base_latent_hw", None)
-        if base_hw is not None:
-            base_h, base_w = int(base_hw[0]), int(base_hw[1])
-            base_side = max(base_h, base_w)
-
-            # 먼저 base latent의 긴 변 길이에 맞춰 정사각형으로 맞춘 뒤,
-            # 실행 해상도에 해당하는 직사각 latent 영역으로 중앙 crop.
-            mask = F.interpolate(mask, size=(base_side, base_side), mode='bilinear', align_corners=False)
-            mask = mask[:, :, :base_side, :base_side]
-
-            crop_top = (base_side - base_h) // 2
-            crop_left = (base_side - base_w) // 2
-            mask = mask[:, :, crop_top:crop_top + base_h, crop_left:crop_left + base_w]
 
         # 마지막으로 현재 attention 계층 spatial 해상도로 맞춤.
         mask = F.interpolate(mask, size=(target_h, target_w), mode='bilinear', align_corners=False)
@@ -242,31 +218,13 @@ class CrossAttention(nn.Module):
     def _load_and_preprocess_label_map(self, mask_path, target_h, target_w, device):
         """
         _mask.npy를 HxW label map(0..N-1)으로 읽고 현재 attention 계층 해상도로 변환합니다.
-        기하 변환 규칙은 기존 mask 경로와 동일하게 맞춥니다.
+        crop 없이 nearest resize만 적용하여 전체 라벨 영역을 유지합니다.
         """
         label = torch.tensor(np.load(mask_path), dtype=torch.float32, device=device)
         if label.ndim != 2:
             raise ValueError(f"label map은 2D여야 합니다: {mask_path}, shape={tuple(label.shape)}")
 
         label = label.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-        # dataset.py 전처리와 맞추기 위해 중앙 정사각 crop
-        h0, w0 = label.shape[-2], label.shape[-1]
-        side = min(h0, w0)
-        top = (h0 - side) // 2
-        left = (w0 - side) // 2
-        label = label[:, :, top:top + side, left:left + side]
-
-        base_hw = getattr(self, "base_latent_hw", None)
-        if base_hw is not None:
-            base_h, base_w = int(base_hw[0]), int(base_hw[1])
-            base_side = max(base_h, base_w)
-
-            # label map은 라벨 보존을 위해 nearest interpolation 사용
-            label = F.interpolate(label, size=(base_side, base_side), mode='nearest')
-            crop_top = (base_side - base_h) // 2
-            crop_left = (base_side - base_w) // 2
-            label = label[:, :, crop_top:crop_top + base_h, crop_left:crop_left + base_w]
 
         label = F.interpolate(label, size=(target_h, target_w), mode='nearest')
         return label.squeeze(0).squeeze(0)
@@ -285,21 +243,6 @@ class CrossAttention(nn.Module):
             mask = mask / 255.0
         mask = mask.clamp(0.0, 1.0)
         mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-        h0, w0 = mask.shape[-2], mask.shape[-1]
-        side = min(h0, w0)
-        top = (h0 - side) // 2
-        left = (w0 - side) // 2
-        mask = mask[:, :, top:top + side, left:left + side]
-
-        base_hw = getattr(self, "base_latent_hw", None)
-        if base_hw is not None:
-            base_h, base_w = int(base_hw[0]), int(base_hw[1])
-            base_side = max(base_h, base_w)
-            mask = F.interpolate(mask, size=(base_side, base_side), mode='bilinear', align_corners=False)
-            crop_top = (base_side - base_h) // 2
-            crop_left = (base_side - base_w) // 2
-            mask = mask[:, :, crop_top:crop_top + base_h, crop_left:crop_left + base_w]
 
         mask = F.interpolate(mask, size=(target_h, target_w), mode='bilinear', align_corners=False)
         return mask.squeeze(0).permute(1, 2, 0).contiguous().clamp_(0.0, 1.0)  # (h,w,1)
@@ -774,46 +717,6 @@ class CrossAttention(nn.Module):
                         )
                       
                         cat_sim = torch.cat(style_sims + [cc_sim], 2)
-                        ### poly fit을 통한 tau 정하기
-                        H, Nq, Nk_cat = cat_sim.shape
-                        def log_pmax(logits, dim=-1):
-                            # logits: (..., N)
-                            max_logit, _ = logits.max(dim=dim, keepdim=True)
-                            lse = torch.logsumexp(logits, dim=dim, keepdim=True)
-                            return (max_logit - lse).squeeze(dim)
-                        logp_cc  = log_pmax(cc_sim)    # (H, Nq)
-                        logp_cat = log_pmax(cat_sim)   # (H, Nq)
-    
-                        # (H, Nq)
-                        delta = logp_cc - logp_cat   # head-wise per query
-
-                        # head별 하나의 delta로 만들기 (query 평균)
-                        delta_head = delta.mean(dim=1)   # (H,)
-
-                        # ----------------------------------------
-                        # polynomial tau (2nd order)
-                        # tau = a * Δ^2 + b * Δ + c
-                        # ----------------------------------------
-
-                        a1 = 0.08395199
-                        b2 = 0.43704639
-                        c3 = 1.00998177
-
-                        tau = a1 * delta_head**2 + b2 * delta_head + c3   # (H,)
-
-                        # 안정성 클램프 (optional but strongly recommended)
-                        tau = torch.clamp(tau, min=1.0, max=5.0) # tau가 1보다 작아지는 것을 방지
-                        # ----------------------------------------
-                        # head-wise temperature scaling
-                        # ----------------------------------------
-
-                        # (H, 1, 1)로 reshape해서 broadcasting
-                        tau = tau.view(H, 1, 1)
-
-                        cat_sim = tau * (cat_sim - cat_sim.mean(dim=-1, keepdim=True)) + cat_sim.mean(dim=-1, keepdim=True) # group-wise mean 유지
-                        
-                        cat_sim = cat_sim.softmax(dim=-1)
-                        ### poly fit을 통한 tau 정하기      
                         cat_v = torch.cat(style_v_branches[:num_styles] + [v_cnt], 1)
 
                         cat_sim = cat_sim.softmax(-1)
@@ -862,7 +765,7 @@ class CrossAttention(nn.Module):
                             attn_matrix_scale=attn_matrix_scale,
                             ch = 1.0,
                         )# Qcs Ks2 + a2
-                    
+
                         ### 26/01/01: pi_star 버전
                         pi_star = 0.9
                         # print(f"2-style은 기존것 그대로 구현중.")
@@ -1099,4 +1002,3 @@ class SpatialTransformer(nn.Module):
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in
-#test

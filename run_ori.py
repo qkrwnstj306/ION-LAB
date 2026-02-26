@@ -105,23 +105,19 @@ def get_resolution_scoped_precomputed_dir(base_dir, h, w):
     return os.path.join(base_dir, f"{h}x{w}")
 
 
-def center_crop_tensor_hw(x, target_h, target_w):
+def resize_tensor_hw(x, target_h, target_w, mode="bilinear"):
     """
-    4D tensor(B, C, H, W)를 정중앙 기준으로 target_h x target_w로 crop합니다.
-    run 스크립트에서 후처리로 해상도 정렬할 때 사용합니다.
+    4D tensor(B, C, H, W)를 target_h x target_w로 "resize"합니다.
+    (crop이 아니라 전체 이미지를 유지한 채 크기만 변경)
     """
     if x.ndim != 4:
-        raise ValueError(f"center_crop_tensor_hw는 4D tensor만 지원합니다. 현재 shape={tuple(x.shape)}")
+        raise ValueError(f"resize_tensor_hw는 4D tensor만 지원합니다. 현재 shape={tuple(x.shape)}")
 
-    _, _, h, w = x.shape
-    if target_h > h or target_w > w:
-        raise ValueError(
-            f"target crop 크기가 입력보다 큽니다. input=({h}, {w}), target=({target_h}, {target_w})"
-        )
-
-    top = (h - target_h) // 2
-    left = (w - target_w) // 2
-    return x[:, :, top:top + target_h, left:left + target_w]
+    # mask/이미지 모두 재사용할 수 있도록 interpolation mode를 인자로 분리합니다.
+    # bilinear 계열은 align_corners=False를 사용하고, nearest는 align_corners를 넘기지 않습니다.
+    if mode in {"bilinear", "bicubic", "trilinear", "linear"}:
+        return F.interpolate(x, size=(target_h, target_w), mode=mode, align_corners=False)
+    return F.interpolate(x, size=(target_h, target_w), mode=mode)
 
 
 def prepare_mask_tensor_for_runtime(mask_npy_path, target_h, target_w, device):
@@ -136,18 +132,9 @@ def prepare_mask_tensor_for_runtime(mask_npy_path, target_h, target_w, device):
 
     mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    # 1) 먼저 정중앙 기준으로 정사각형 crop (dataset.py의 image crop과 동일한 방향)
-    h0, w0 = mask.shape[-2], mask.shape[-1]
-    side = min(h0, w0)
-    top = (h0 - side) // 2
-    left = (w0 - side) // 2
-    mask = mask[:, :, top:top + side, left:left + side]
-
-    
-    # 2)  run 단계에서 target(H,W)로 중앙 crop
-    square_side = max(target_h, target_w)
-    mask = F.interpolate(mask, size=(square_side, square_side), mode="bilinear", align_corners=False)
-    mask = center_crop_tensor_hw(mask, target_h, target_w)
+    # crop 대신 resize를 사용하여 전체 마스크 영역을 유지합니다.
+    # (입력 이미지 전체를 보존하려는 멀티 해상도 정책과 동일)
+    mask = resize_tensor_hw(mask, target_h, target_w, mode="bilinear")
     return mask
 
 
@@ -300,7 +287,7 @@ def parse_multistyle_meta_samples(data_root, meta_file):
 def prepare_style_mask_tensor_for_runtime(mask_npy_path, target_h, target_w, device):
     """
     스타일 마스크 파일(_mask{i}.npy)을 실행 해상도(H, W) 기준으로 정렬합니다.
-    (중앙 정사각 crop -> 정사각 resize -> 중앙 crop)을 적용합니다.
+    crop 없이 resize만 적용하여 전체 마스크 영역을 유지합니다.
 
     반환 shape: (1, 1, target_h, target_w), dtype=float32, 값 범위는 [0, 1]
     """
@@ -315,16 +302,8 @@ def prepare_style_mask_tensor_for_runtime(mask_npy_path, target_h, target_w, dev
 
     mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    h0, w0 = mask.shape[-2], mask.shape[-1]
-    side = min(h0, w0)
-    top = (h0 - side) // 2
-    left = (w0 - side) // 2
-    mask = mask[:, :, top:top + side, left:left + side]
-
-    square_side = max(target_h, target_w)
     # 바이너리 마스크라도 리사이즈 경계부에서 soft weight를 허용해 더 부드럽게 혼합될 수 있게 합니다.
-    mask = F.interpolate(mask, size=(square_side, square_side), mode="bilinear", align_corners=False)
-    mask = center_crop_tensor_hw(mask, target_h, target_w)
+    mask = resize_tensor_hw(mask, target_h, target_w, mode="bilinear")
     return mask.clamp_(0.0, 1.0)
 
 
