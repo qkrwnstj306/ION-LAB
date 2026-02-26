@@ -22,11 +22,19 @@ from dataset import TripleImageDataset, SingleImageDataset
 
 feat_maps = []
 
+# 이미지 파일 탐색 시 사용하는 확장자 목록입니다.
+VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
 # run_ori.py와 동일한 해상도 정책을 사용해야 precomputed feature shape가 정확히 맞음.
 SUPPORTED_INFERENCE_HW = {
     (512, 512),
+    (512, 768),
     (512, 1024),
+    (768, 512),
+    (768, 768),
+    (768, 1024),
     (1024, 512),
+    (1024, 768),
     (1024, 1024),
 }
 
@@ -107,6 +115,35 @@ def load_img(path, target_h=512, target_w=512):
     image = 2. * image - 1.
     image = center_crop_tensor_hw(image, target_h, target_w)
     return image
+
+
+def list_image_paths(folder, recursive=False):
+    """
+    지정한 폴더에서 이미지 파일 경로를 수집합니다.
+    - recursive=True: 하위 폴더까지 모두 탐색 (style 폴더용)
+    - recursive=False: 현재 폴더만 탐색 (기본)
+    """
+    if not folder or not os.path.isdir(folder):
+        return []
+
+    image_paths = []
+    if recursive:
+        for root, _, files in os.walk(folder):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in VALID_IMAGE_EXTENSIONS:
+                    image_paths.append(os.path.join(root, name))
+    else:
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in VALID_IMAGE_EXTENSIONS:
+                image_paths.append(path)
+
+    image_paths.sort()
+    return image_paths
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -190,9 +227,12 @@ def main():
         time_idx_dict[i] = t
     
     global feat_maps
-    feat_maps = [{'config': {
-                'T': 1.5
-                }} for _ in range(50)]
+    # 이미지마다 동일한 버퍼 템플릿을 재사용하기 위해 길이를 현재 DDIM step 수에 맞춰 생성합니다.
+    def reset_feat_maps_buffer():
+        global feat_maps
+        feat_maps = [{'config': {'T': 1.5}} for _ in range(len(time_range))]
+
+    reset_feat_maps_buffer()
 
     def ddim_sampler_callback(pred_x0, xt, i):
         save_feature_maps_callback(i)
@@ -269,159 +309,99 @@ def main():
     uc = model.get_learned_conditioning([""])
     shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
 
-    # === DATASET ===
-    # dataset = TripleImageDataset(opt.data_root, "dataset.txt", image_size=512, device=device)
-    # dataset.py는 정사각형만 지원하므로, 더 큰 변 기준 정사각형으로 로드 후 중앙 crop합니다.
-    dataset = SingleImageDataset("./cross_val", image_size=max(opt.H, opt.W), device=device)
+    # ==========================
+    # content/style precompute 대상 경로 결정
+    # ==========================
+    # --cnt/--sty를 지정하면 해당 경로를 우선 사용하고,
+    # 미지정 시에는 data_root 기준 기본 폴더를 사용합니다.
+    cnt_folder = opt.cnt if opt.cnt is not None else os.path.join(opt.data_root, "cnt")
+    sty_folder = opt.sty if opt.sty is not None else os.path.join(opt.data_root, "sty")
 
-    for idx in range(len(dataset)):
-        cnt_img, cnt_path = dataset[idx]
-        # cnt_img = cnt_img.to(device, non_blocking=True)
-        # cnt_img, char_img, back_img, cnt_path, char_path, back_path = dataset[idx]
-        # 최종 실행 해상도(H, W)에 맞춰 중앙 crop하여 latent shape를 고정합니다.
-        cnt_img = center_crop_tensor_hw(cnt_img, opt.H, opt.W)
-        cnt_img = cnt_img.to(device, non_blocking=True)
-        # char_img = char_img.to(device, non_blocking=True)
-        # back_img = back_img.to(device, non_blocking=True)
-        # ===== CONTENT FEATURE =====
-        # cnt_feat_name = os.path.join(
-        #     feat_path_root, os.path.splitext(os.path.basename(cnt_path))[0] + '_cnt.pkl'
-        # )
+    # content는 보통 cnt 폴더 바로 아래에 있으므로 기본은 비재귀,
+    # style은 char/back/extra 등 하위 폴더 구성을 지원하기 위해 재귀 탐색합니다.
+    cnt_image_paths = list_image_paths(cnt_folder, recursive=False)
+    sty_image_paths = list_image_paths(sty_folder, recursive=True)
+
+    if not cnt_image_paths:
+        print(f"[Info] No content images found in: {cnt_folder}")
+    if not sty_image_paths:
+        print(f"[Info] No style images found in: {sty_folder}")
+
+    # basename 기반으로 pkl 이름을 만들기 때문에, 서로 다른 파일이 같은 basename이면 덮어쓰기됩니다.
+    # run_ori.py도 basename 기준으로 찾으므로 여기서 명시적으로 잡아주는 편이 안전합니다.
+    seen_output_to_source = {}
+
+    # ===== STYLE FEATURE ( *_sty.pkl ) =====
+    for sty_path in sty_image_paths:
+        sty_name = os.path.basename(sty_path)
+        sty_feat_name = os.path.join(
+            feat_path_root, os.path.splitext(sty_name)[0] + '_sty.pkl'
+        )
+
+        prev_src = seen_output_to_source.get(sty_feat_name)
+        if prev_src is not None and os.path.abspath(prev_src) != os.path.abspath(sty_path):
+            raise ValueError(
+                f"Style basename 충돌로 동일 pkl 경로가 겹칩니다:\n"
+                f" - {prev_src}\n - {sty_path}\n"
+                f" -> {sty_feat_name}"
+            )
+        seen_output_to_source[sty_feat_name] = sty_path
+
+        if os.path.isfile(sty_feat_name):
+            print(f"Precomputed style feature exists: {sty_feat_name}")
+            continue
+
+        # 이미지마다 feature 버퍼를 초기화해야 이전 이미지의 잔여 키가 섞이지 않습니다.
+        reset_feat_maps_buffer()
+        init_sty = load_img(sty_path, target_h=opt.H, target_w=opt.W).to(device)
+        init_sty_latent = model.get_first_stage_encoding(model.encode_first_stage(init_sty))
+        sty_z_enc, _ = sampler.encode_ddim(
+            init_sty_latent.clone(),
+            num_steps=ddim_inversion_steps,
+            unconditional_conditioning=uc,
+            end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
+            callback_ddim_timesteps=save_feature_timesteps,
+            img_callback=ddim_sampler_callback
+        )
+        with open(sty_feat_name, 'wb') as f:
+            pickle.dump(copy.deepcopy(feat_maps), f)
+        print(f"Saved style feature: {sty_feat_name}")
+
+    # ===== CONTENT FEATURE ( *_cnt.pkl ) =====
+    for cnt_path in cnt_image_paths:
+        cnt_name = os.path.basename(cnt_path)
         cnt_feat_name = os.path.join(
-            feat_path_root, os.path.splitext(os.path.basename(cnt_path))[0] + '.pkl'
-        )        
+            feat_path_root, os.path.splitext(cnt_name)[0] + '_cnt.pkl'
+        )
+
+        prev_src = seen_output_to_source.get(cnt_feat_name)
+        if prev_src is not None and os.path.abspath(prev_src) != os.path.abspath(cnt_path):
+            raise ValueError(
+                f"Content basename 충돌로 동일 pkl 경로가 겹칩니다:\n"
+                f" - {prev_src}\n - {cnt_path}\n"
+                f" -> {cnt_feat_name}"
+            )
+        seen_output_to_source[cnt_feat_name] = cnt_path
+
         if os.path.isfile(cnt_feat_name):
             print(f"Precomputed content feature exists: {cnt_feat_name}")
-        else:
-            init_cnt_latent = model.get_first_stage_encoding(model.encode_first_stage(cnt_img))
-            residuals_all = {}
-            cnt_z_enc, _ = sampler.encode_ddim(
-                init_cnt_latent.clone(),
-                num_steps=ddim_inversion_steps,
-                unconditional_conditioning=uc,
-                end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
-                callback_ddim_timesteps=save_feature_timesteps,
-                img_callback=residual_injection_callback
-            )
-            with open(cnt_feat_name, "wb") as f:
-                pickle.dump(copy.deepcopy(feat_maps), f)
-            print(f"Saved content feature: {cnt_feat_name}")
+            continue
 
-        # # ===== CHAR STYLE FEATURE =====
-        # char_feat_name = os.path.join(
-        #     feat_path_root, os.path.splitext(os.path.basename(char_path))[0] + '_sty.pkl'
-        # )
-        # if os.path.isfile(char_feat_name):
-        #     print(f"Precomputed char style feature exists: {char_feat_name}")
-        # else:
-        #     init_char_latent = model.get_first_stage_encoding(model.encode_first_stage(char_img))
-        #     char_z_enc, _ = sampler.encode_ddim(
-        #         init_char_latent.clone(),
-        #         num_steps=ddim_inversion_steps,
-        #         unconditional_conditioning=uc,
-        #         end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
-        #         callback_ddim_timesteps=save_feature_timesteps,
-        #         img_callback=ddim_sampler_callback
-        #     )
-        #     with open(char_feat_name, "wb") as f:
-        #         pickle.dump(copy.deepcopy(feat_maps), f)
-        #     print(f"Saved char style feature: {char_feat_name}")
-
-        # # ===== BACK STYLE FEATURE =====
-        # back_feat_name = os.path.join(
-        #     feat_path_root, os.path.splitext(os.path.basename(back_path))[0] + '_sty.pkl'
-        # )
-        # if os.path.isfile(back_feat_name):
-        #     print(f"Precomputed back style feature exists: {back_feat_name}")
-        # else:
-        #     init_back_latent = model.get_first_stage_encoding(model.encode_first_stage(back_img))
-        #     back_z_enc, _ = sampler.encode_ddim(
-        #         init_back_latent.clone(),
-        #         num_steps=ddim_inversion_steps,
-        #         unconditional_conditioning=uc,
-        #         end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
-        #         callback_ddim_timesteps=save_feature_timesteps,
-        #         img_callback=ddim_sampler_callback
-        #     )
-        #     with open(back_feat_name, "wb") as f:
-        #         pickle.dump(copy.deepcopy(feat_maps), f)
-        #     print(f"Saved back style feature: {back_feat_name}")
-
-##
-    # sty_img_list = sorted(os.listdir(opt.sty))
-    # cnt_img_list = sorted(os.listdir(opt.cnt))
-
-    # # === STYLE IMAGES ===
-    # if opt.sty is not None and os.path.exists(opt.sty):
-    #     sty_img_list = sorted(os.listdir(opt.sty))
-    #     for sty_name in sty_img_list:
-    #         sty_path = os.path.join(opt.sty, sty_name)
-    #         init_sty = load_img(sty_path).to(device)
-    #         sty_feat_name = os.path.join(feat_path_root, os.path.splitext(sty_name)[0] + '_sty.pkl')
-
-    #         if os.path.isfile(sty_feat_name):
-    #             print(f"Precomputed style feature exists: {sty_feat_name}")
-    #         else:
-    #             init_sty_latent = model.get_first_stage_encoding(model.encode_first_stage(init_sty))
-    #             sty_z_enc, _ = sampler.encode_ddim(
-    #                 init_sty_latent.clone(),
-    #                 num_steps=ddim_inversion_steps,
-    #                 unconditional_conditioning=uc,
-    #                 end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
-    #                 callback_ddim_timesteps=save_feature_timesteps,
-    #                 img_callback=ddim_sampler_callback
-    #             )
-    #             sty_feat = copy.deepcopy(feat_maps)
-    #             with open(sty_feat_name, 'wb') as f:
-    #                 pickle.dump(sty_feat, f)
-    #             print(f"Saved style feature: {sty_feat_name}")
-    # else:
-    #     print("No style images provided or path does not exist. Skipping style inversion.")
-
-    # # === CONTENT IMAGES ===
-    # if opt.cnt is not None and os.path.exists(opt.cnt):
-    #     cnt_img_list = sorted(os.listdir(opt.cnt))
-    #     for cnt_name in cnt_img_list:
-    #         cnt_path = os.path.join(opt.cnt, cnt_name)
-    #         init_cnt = load_img(cnt_path).to(device)
-    #         cnt_feat_name = os.path.join(feat_path_root, os.path.splitext(cnt_name)[0] + '_cnt.pkl')
-
-    #         if os.path.isfile(cnt_feat_name):
-    #             print(f"Precomputed content feature exists: {cnt_feat_name}")
-    #         else:
-    #             init_cnt_latent = model.get_first_stage_encoding(model.encode_first_stage(init_cnt))
-    #             #save_path = f"/home/dldpfud/hdd/diffusion_model/styleID/precomputed_feats_share/0801/resnet_611_hf/{cnt_name}_residuals.pkl"
-    #             # unet_model.save_residuals = True
-    #             # unet_model.residual_save_path = save_path
-                
-    #             residuals_all = {}  # { timestep: { "output_block_{i}_residual": Tensor, ... }, ... }
-    #             cnt_z_enc, _ = sampler.encode_ddim(
-    #                 init_cnt_latent.clone(),
-    #                 num_steps=ddim_inversion_steps,
-    #                 unconditional_conditioning=uc,
-    #                 end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
-    #                 callback_ddim_timesteps=save_feature_timesteps,
-    #                 img_callback=residual_injection_callback
-    #             )
-                
-    #             all_path = os.path.join(
-    #                 feat_path_root,
-    #                 f"{os.path.splitext(cnt_name)[0]}_residuals_all.pkl"
-    #             )
-    #             os.makedirs(os.path.dirname(all_path), exist_ok=True)
-    #             with open(all_path, "wb") as f:
-    #                 pickle.dump(residuals_all, f)
-                
-    #             base_path = os.path.splitext(all_path)[0]
-    #             #visualize_cnt_high_freq_overlay(residuals_all, base_img=init_cnt, save_path=base_path + "_hf_overlay.png")
-
-
-    #             cnt_feat = copy.deepcopy(feat_maps)
-    #             with open(cnt_feat_name, 'wb') as f:
-    #                 pickle.dump(cnt_feat, f)
-    #             print(f"Saved content feature: {cnt_feat_name}")
-    # else:
-    #     print("No content images provided or path does not exist. Skipping content inversion.")
+        reset_feat_maps_buffer()
+        init_cnt = load_img(cnt_path, target_h=opt.H, target_w=opt.W).to(device)
+        init_cnt_latent = model.get_first_stage_encoding(model.encode_first_stage(init_cnt))
+        residuals_all = {}
+        cnt_z_enc, _ = sampler.encode_ddim(
+            init_cnt_latent.clone(),
+            num_steps=ddim_inversion_steps,
+            unconditional_conditioning=uc,
+            end_step=time_idx_dict[ddim_inversion_steps - 1 - start_step],
+            callback_ddim_timesteps=save_feature_timesteps,
+            img_callback=residual_injection_callback
+        )
+        with open(cnt_feat_name, 'wb') as f:
+            pickle.dump(copy.deepcopy(feat_maps), f)
+        print(f"Saved content feature: {cnt_feat_name}")
 
 if __name__ == "__main__":
     main()
