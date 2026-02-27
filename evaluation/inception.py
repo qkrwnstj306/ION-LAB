@@ -86,6 +86,7 @@ class Inception3(nn.Module):
             x = torch.cat((x_ch0, x_ch1, x_ch2), 1)
         return x
 
+    #def _forward(self, x: Tensor, mask: Optional[Tensor]=None, return_features: bool=False, back: bool=False) -> Tuple[Tensor, Optional[Tensor]]:#mask 버전
     def _forward(self, x: Tensor, return_features: bool=False) -> Tuple[Tensor, Optional[Tensor]]:
         # N x 3 x 299 x 299
         x = self.Conv2d_1a_3x3(x)
@@ -131,9 +132,28 @@ class Inception3(nn.Module):
         # N x 2048 x 8 x 8
         x = self.Mixed_7c(x)
         # N x 2048 x 8 x 8
+
+        ##### mask 버전
+        # if mask is not None:# mask 버전
+        #     if mask.shape[1] == 3:
+        #         mask = mask.mean(dim=1, keepdim=True)  # [N,1,H,W]
+        #     # 2. threshold 적용
+        #     mask = (mask > 0.5).float()
+        #     mask = F.interpolate(mask, size=x.shape[2:], mode='nearest')  # 8x8로 resize
+        #     mask = mask.to(x.device)
+        #     if back:
+        #         print("Using background mask")
+        #         mask = 1.0 - mask
+        #     masked_sum = (x * mask).sum(dim=[2,3], keepdim=True)
+        #     mask_count = mask.sum(dim=[2,3], keepdim=True).clamp(min=1e-6)
+        #     x = masked_sum / mask_count
+        # else:
+        #     x = self.avgpool(x)
+        ##### mask 버전 끝
+
         # Adaptive average pooling
-        x = self.avgpool(x)
-        # N x 2048 x 1 x 1
+        x = self.avgpool(x)#mask 버전일때 주석처리
+        # # N x 2048 x 1 x 1
         x = self.dropout(x)
         # N x 2048 x 1 x 1
         x = torch.flatten(x, 1)
@@ -152,10 +172,13 @@ class Inception3(nn.Module):
         else:
             return out1, out2  # type: ignore[return-value]
 
+    #def forward(self, x: Tensor, mask: Optional[Tensor]=None, return_features: bool=False, back: bool=False) -> InceptionOutputs:#mask 버전
     def forward(self, x: Tensor, return_features: bool=False) -> InceptionOutputs:
         x = self._transform_input(x)
         if return_features:
+            #return self._forward(x, mask=mask, return_features=True, back=back)#mask 버전
             return self._forward(x, return_features=True)
+        #out1, out2, aux1, aux2 = self._forward(x, mask=mask, return_features=False, back=back)#mask 버전
         out1, out2, aux1, aux2 = self._forward(x)
         aux_defined = self.training and self.aux_logits
         if torch.jit.is_scripting():

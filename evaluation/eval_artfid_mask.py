@@ -10,7 +10,7 @@ from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normal
 from tqdm import tqdm
 
 import utils
-import inception
+import inception_mask
 import image_metrics
 
 ALLOWED_IMAGE_EXTENSIONS = ['jpg', 'JPG', 'jpeg', 'JPEG', 'png', 'PNG']
@@ -80,6 +80,63 @@ def get_activations(files, model, batch_size=50, device='cpu', num_workers=1):
     pbar.close()
     return pred_arr
 
+def get_activations_w_mask(files, model, mask_image_path, batch_size=50, device='cpu', num_workers=1, back=False):
+    """Computes the activations of for all images.
+
+    Args:
+        files (list): List of image file paths.
+        model (torch.nn.Module): Model for computing activations.
+        batch_size (int): Batch size for computing activations.
+        device (torch.device): Device for commputing activations.
+        num_workers (int): Number of threads for data loading.
+
+    Returns:
+        (): Activations of the images, shape [num_images, 2048].
+    """
+    model.eval()
+
+    if batch_size > len(files):
+        print("Warning: batch size is bigger than the data size. Setting batch size to data size")
+        batch_size = len(files)
+
+    # 이미지 dataset
+    dataset = ImagePathDataset(files, transforms=Compose([Resize(512), ToTensor()]))
+
+    # mask dataset
+    if mask_image_path is not None:
+        print("Mask path is given. Apply mask to images when computing activations.")
+        mask_dataset = ImagePathDataset(mask_image_path, transforms=Compose([Resize(512), ToTensor()]))
+        dataset = list(zip(dataset, mask_dataset))  # tuple: (image, mask)
+
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=batch_size,
+                                             shuffle=False,
+                                             drop_last=False,
+                                             num_workers=num_workers)
+
+    pred_arr = np.empty((len(files), 2048))
+    start_idx = 0
+    pbar = tqdm(total=len(files))
+
+    for batch in dataloader:
+        if mask_image_path is not None:
+            batch_imgs, batch_masks = batch
+            batch_imgs = batch_imgs.to(device)
+            batch_masks = batch_masks.to(device)
+        else:
+            batch_imgs = batch.to(device)
+            batch_masks = None
+
+        with torch.no_grad():
+            features = model(batch_imgs, mask=batch_masks, return_features=True, back=back)  # 모델 내부에서 mask 적용
+
+        features = features.cpu().numpy()
+        pred_arr[start_idx:start_idx + features.shape[0]] = features
+        start_idx += features.shape[0]
+        pbar.update(batch_imgs.shape[0])
+
+    pbar.close()
+    return pred_arr
 
 def compute_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """Numpy implementation of the Frechet Distance.
@@ -202,7 +259,7 @@ def compute_fid(path_to_stylized, path_to_style, batch_size, device, num_workers
     ckpt_file = utils.download(CKPT_URL)
     ckpt = torch.load(ckpt_file, map_location=device)
     
-    model = inception.Inception3().to(device)
+    model = inception_mask.Inception3().to(device)#mask 버전 inception파일 불러오기
     model.load_state_dict(ckpt, strict=False)
     model.eval()
     
@@ -216,7 +273,7 @@ def compute_fid(path_to_stylized, path_to_style, batch_size, device, num_workers
     return fid_value
 
 
-def compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, num_points=15, num_workers=1):
+def compute_fid_infinity(path_to_stylized, path_to_style, mask_path, batch_size, device, num_points=15, num_workers=1, back=False):#mask넣어주기
     """Computes the FID infinity for the given paths.
 
     Args:
@@ -235,17 +292,21 @@ def compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, nu
     ckpt_file = utils.download(CKPT_URL)
     ckpt = torch.load(ckpt_file, map_location=device)
     
-    model = inception.Inception3().to(device)
+    model = inception_mask.Inception3().to(device)
     model.load_state_dict(ckpt, strict=False)
     model.eval()
 
+    mask_image_paths = get_image_paths(mask_path)#mask path가져오기
     stylized_image_paths = get_image_paths(path_to_stylized)
     style_image_paths = get_image_paths(path_to_style)
 
     assert len(stylized_image_paths) == len(style_image_paths), \
            f'Number of stylized images and number of style images must be equal.({len(stylized_image_paths)},{len(style_image_paths)})'
 
-    activations_stylized = get_activations(stylized_image_paths, model, batch_size, device, num_workers)
+#######char와 back일때 다르게 인자 주기
+    activations_stylized = get_activations_w_mask(stylized_image_paths, model, mask_image_paths, batch_size, device, num_workers, back=back)#stylized에만 mask 넣어주기, char or back
+####### -> True면 background mask, False면 character mask
+
     activations_style = get_activations(style_image_paths, model, batch_size, device, num_workers)
     activation_idcs = np.arange(activations_stylized.shape[0])
 
@@ -398,7 +459,7 @@ def compute_patch_simi(path_to_stylized, path_to_content, batch_size, device, nu
 
     return dist_sum / N
 
-def compute_art_fid(path_to_stylized, path_to_style, path_to_content, batch_size, device, mode='art_fid_inf', content_metric='lpips', num_workers=1):
+def compute_art_fid(path_to_stylized, path_to_style, path_to_content, mask_path, batch_size, device, mode='art_fid_inf', content_metric='lpips', num_workers=1, back=False):#mask넣어주기
     """Computes the FID for the given paths.
 
     Args:
@@ -415,7 +476,7 @@ def compute_art_fid(path_to_stylized, path_to_style, path_to_content, batch_size
     """
     print('Compute FID value...')
     if mode == 'art_fid_inf':
-        fid_value = compute_fid_infinity(path_to_stylized, path_to_style, batch_size, device, num_workers)
+        fid_value = compute_fid_infinity(path_to_stylized, path_to_style, mask_path, batch_size, device, num_workers, back=back)#mask넣어주기
     elif mode == 'art_fid':
         fid_value = compute_fid(path_to_stylized, path_to_style, batch_size, device, num_workers)
     elif mode == 'style_loss':
@@ -463,25 +524,31 @@ def main():
     parser.add_argument('--sty', type=str, required=True, help='Path to style images.')
     parser.add_argument('--cnt', type=str, required=True, help='Path to content images.')
     parser.add_argument('--tar', type=str, required=True, help='Path to stylized images.')
+    parser.add_argument('--mask', type=str, required=True, help='Path to mask images.') #mask넣어주기
+    parser.add_argument('--back', type=str, default='False', help='If True, use background mask. If False, use character mask.') #char or back
     args = parser.parse_args()
+    back_flag = args.back.lower() == 'true'
 
     artfid, fid, lpips, lpips_gray = compute_art_fid(args.tar,
                                                     args.sty,
                                                     args.cnt,
+                                                    args.mask,#mask넣어주기
                                                     args.batch_size,
                                                     args.device,
                                                     args.mode,
                                                     args.content_metric,
-                                                    args.num_workers)
+                                                    args.num_workers,
+                                                    back_flag#char or back
+                                                    )
 
-    cfsd = compute_cfsd(args.tar,
-                        args.cnt,
-                        args.batch_size,
-                        args.device,
-                        args.num_workers)
+    # cfsd = compute_cfsd(args.tar,
+    #                     args.cnt,
+    #                     args.batch_size,
+    #                     args.device,
+    #                     args.num_workers)
 
     print('ArtFID:', artfid, 'FID:', fid, 'LPIPS:', lpips, 'LPIPS_gray:', lpips_gray)
-    print('CFSD:', cfsd)
+    #print('CFSD:', cfsd)
 
 if __name__ == '__main__':
     main()
