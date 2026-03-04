@@ -356,9 +356,10 @@ class CrossAttention(nn.Module):
         #10/31 tau 수식 변경후
         #12/03 figure 구성 건으로 배수 2 -> 4로 수정
         #12/10 4로 실행
-        mean = sim.mean(dim=-1, keepdim=True)
+        # tau 임의 설정
+        # mean = sim.mean(dim=-1, keepdim=True)
         
-        sim = (sim - mean) * attn_matrix_scale + mean
+        # sim = (sim - mean) * attn_matrix_scale + mean
         #####
              
         head_num = sim.shape[0]
@@ -373,23 +374,23 @@ class CrossAttention(nn.Module):
         # 기존 mask 적용 방식
         sim_reshaped = sim.reshape(head_num, h, w, pixel_size)
         ## cc_sim은 content-content query-key 내적에 scale까지 한 값.
-        cc_sim_reshaped = cc_sim.reshape(head_num, h, w, pixel_size)
+        # cc_sim_reshaped = cc_sim.reshape(head_num, h, w, pixel_size)
         
-        delta_q = rearrange(delta_q, "(b h) n d -> h (b n) d", h=num_heads)
-        delta_k = rearrange(delta_k, "(b h) n d -> h (b n) d", h=num_heads)
-        max_sim = torch.einsum("h i d, h j d -> h i j", delta_q, delta_k)
-        max_sim_reshaped = max_sim.reshape(head_num, h, w, pixel_size)
+        # delta_q = rearrange(delta_q, "(b h) n d -> h (b n) d", h=num_heads)
+        # delta_k = rearrange(delta_k, "(b h) n d -> h (b n) d", h=num_heads)
+        # max_sim = torch.einsum("h i d, h j d -> h i j", delta_q, delta_k)
+        # max_sim_reshaped = max_sim.reshape(head_num, h, w, pixel_size)
 
-        min_cc_sim_reshaped, _ = torch.min(
-            cc_sim_reshaped, dim=3, keepdim=True)
-        max_sim_reshaped, _ = torch.max(max_sim_reshaped, dim=3, keepdim=True)
-        start = 0.5
-        end = -0.5
-        # 정사각형 전제(w==h)였던 기존 코드의 안전한 일반화.
-        # 직사각형에서도 모든 row에 동일하게 마스크 보정이 적용되도록 h를 사용.
-        # 기존 구현: length = w 정사각형이었으므로 h나 w나 상관없었음. 
-        # 이제는 w!=h일 수 있으므로 h를 사용해서 모든 row에 동일하게 마스크 보정이 적용되도록 함.
-        length = h
+        # min_cc_sim_reshaped, _ = torch.min(
+        #     cc_sim_reshaped, dim=3, keepdim=True)
+        # max_sim_reshaped, _ = torch.max(max_sim_reshaped, dim=3, keepdim=True)
+        # start = 0.5
+        # end = -0.5
+        # # 정사각형 전제(w==h)였던 기존 코드의 안전한 일반화.
+        # # 직사각형에서도 모든 row에 동일하게 마스크 보정이 적용되도록 h를 사용.
+        # # 기존 구현: length = w 정사각형이었으므로 h나 w나 상관없었음. 
+        # # 이제는 w!=h일 수 있으므로 h를 사용해서 모든 row에 동일하게 마스크 보정이 적용되도록 함.
+        # length = h
         
         
         # mask = torch.tensor(np.load(mask_path), dtype=torch.float32).cuda()
@@ -422,12 +423,12 @@ class CrossAttention(nn.Module):
         
         # 캐시된 마스크 사용
         mask = self.mask_cache[mask_key]
-        gradual_vanished_array = mask.reshape(1, h, w, 1).to(sim.device)
-        delta = min_cc_sim_reshaped - max_sim_reshaped
-        gradual_vanished_mask = (delta)[:, :, :, :] * gradual_vanished_array
+        # gradual_vanished_array = mask.reshape(1, h, w, 1).to(sim.device)
+        # delta = min_cc_sim_reshaped - max_sim_reshaped
+        # gradual_vanished_mask = (delta)[:, :, :, :] * gradual_vanished_array
         #print(f"gradual_vanished_mask shape: {gradual_vanished_mask.shape}")
         # print(f"sim_reshaped.shape:{sim_reshaped.shape}")
-        sim_reshaped[:, :length, :, :] += gradual_vanished_mask
+        # sim_reshaped[:, :length, :, :] += gradual_vanished_mask
         
         sim = sim_reshaped.reshape(head_num, pixel_size, pixel_size)
         
@@ -754,8 +755,6 @@ class CrossAttention(nn.Module):
                         tau = tau.view(H, 1, 1)
 
                         cat_sim = tau * (cat_sim - cat_sim.mean(dim=-1, keepdim=True)) + cat_sim.mean(dim=-1, keepdim=True) # group-wise mean 유지
-                        
-                        cat_sim = cat_sim.softmax(dim=-1)
                         ### poly fit을 통한 tau 정하기      
                         cat_v = torch.cat(style_v_branches[:num_styles] + [v_cnt], 1)
 
@@ -812,6 +811,44 @@ class CrossAttention(nn.Module):
                         sim_1, sim_2 = self.apply_pi_mass_3way(sim_1, sim_2, cc_sim, mask_char, pi_star)
                         
                         cat_sim = torch.cat((sim_1, sim_2, cc_sim), 2)
+                        ### poly fit을 통한 tau 정하기
+                        H, Nq, Nk_cat = cat_sim.shape
+                        def log_pmax(logits, dim=-1):
+                            # logits: (..., N)
+                            max_logit, _ = logits.max(dim=dim, keepdim=True)
+                            lse = torch.logsumexp(logits, dim=dim, keepdim=True)
+                            return (max_logit - lse).squeeze(dim)
+                        logp_cc  = log_pmax(cc_sim)    # (H, Nq)
+                        logp_cat = log_pmax(cat_sim)   # (H, Nq)
+    
+                        # (H, Nq)
+                        delta = logp_cc - logp_cat   # head-wise per query
+
+                        # head별 하나의 delta로 만들기 (query 평균)
+                        delta_head = delta.mean(dim=1)   # (H,)
+
+                        # ----------------------------------------
+                        # polynomial tau (2nd order)
+                        # tau = a * Δ^2 + b * Δ + c
+                        # ----------------------------------------
+
+                        a1 = 0.08395199
+                        b2 = 0.43704639
+                        c3 = 1.00998177
+
+                        tau = a1 * delta_head**2 + b2 * delta_head + c3   # (H,)
+
+                        # 안정성 클램프 (optional but strongly recommended)
+                        tau = torch.clamp(tau, min=1.0, max=5.0) # tau가 1보다 작아지는 것을 방지
+                        # ----------------------------------------
+                        # head-wise temperature scaling
+                        # ----------------------------------------
+
+                        # (H, 1, 1)로 reshape해서 broadcasting
+                        tau = tau.view(H, 1, 1)
+
+                        cat_sim = tau * (cat_sim - cat_sim.mean(dim=-1, keepdim=True)) + cat_sim.mean(dim=-1, keepdim=True) # group-wise mean 유지
+                        ### poly fit을 통한 tau 정하기
                         # batch 차원 맞추기
                         cat_v = torch.cat((v, v_sty_2, v_cnt), 1)# stlye_1 value, stlye_2 value, content value
 
