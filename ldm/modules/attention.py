@@ -210,9 +210,9 @@ class CrossAttention(nn.Module):
         sim = torch.einsum("h i d, h j d -> h i j", qh, kh)
         sim *= self.scale
 
-        # 기존 코드와 동일한 Tau(T) 스케일링 규칙 유지
-        mean = sim.mean(dim=-1, keepdim=True)
-        sim = (sim - mean) * attn_matrix_scale + mean
+        # # 기존 코드와 동일한 Tau(T) 스케일링 규칙 유지
+        # mean = sim.mean(dim=-1, keepdim=True)
+        # sim = (sim - mean) * attn_matrix_scale + mean
         return sim
 
     def _load_and_preprocess_label_map(self, mask_path, target_h, target_w, device):
