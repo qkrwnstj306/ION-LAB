@@ -611,6 +611,16 @@ class CrossAttention(nn.Module):
             mask_path = base_name + "_mask.npy"
             # N-style 신규 규약: content_001_mask0.npy, content_001_mask1.npy, ...
             mask_prefix = base_name + "_mask"
+            single_style_masked_mode = (
+                injection_config is not None
+                and injection_config.get("single_style_mode", None) == "masked"
+                and int(injection_config.get("num_styles", 0)) == 1
+            )
+            single_style_global_mode = (
+                injection_config is not None
+                and injection_config.get("single_style_mode", None) == "global"
+                and int(injection_config.get("num_styles", 0)) == 1
+            )
 
             is_mask_exists = os.path.exists(mask_path)  # legacy 단일 마스크(_mask.npy) 존재 여부
             # N-style에서는 `_mask0.npy`, `_mask1.npy`, ... 존재 여부를 별도로 확인해야 합니다.
@@ -631,7 +641,7 @@ class CrossAttention(nn.Module):
                 self.cnt_name is not None
                 and not is_cross
                 # 2-style legacy는 `_mask.npy`, N-style은 `_mask{i}.npy` 묶음으로 마스크 사용 여부를 판정합니다.
-                and (is_mask_exists or is_nstyle_multimask_exists)
+                and (is_mask_exists or is_nstyle_multimask_exists or single_style_global_mode)
             )
             
 
@@ -699,16 +709,28 @@ class CrossAttention(nn.Module):
                         # 기본 규약은 `_mask0.npy`, `_mask1.npy`, ... 멀티 마스크 파일이며,
                         # 호환성 차원에서 `_mask.npy` label map도 있으면 fallback으로 수용합니다.
                         layer_h, layer_w = self._infer_spatial_hw_from_tokens(q.shape[1])
-                        style_weight_maps = self._load_style_weight_maps_from_mask_files(
-                            mask_prefix=mask_prefix,
-                            target_h=layer_h,
-                            target_w=layer_w,
-                            num_styles=num_styles,
-                            device=q.device,
-                            # N-style 경로에서는 멀티 마스크 파일 규약이 의도이므로,
-                            # `_mask.npy`로의 silent fallback을 막아 잘못된 전체 스타일 적용을 방지합니다.
-                            allow_legacy_label_fallback=False,
-                        )
+                        if single_style_global_mode and num_styles == 1:
+                            # single_ver2: 전 영역을 style/content 혼합 대상으로 처리합니다.
+                            style_weight_maps = torch.ones(
+                                (1, layer_h, layer_w, 1),
+                                device=q.device,
+                                dtype=cc_sim.dtype,
+                            )
+                        else:
+                            style_weight_maps = self._load_style_weight_maps_from_mask_files(
+                                mask_prefix=mask_prefix,
+                                target_h=layer_h,
+                                target_w=layer_w,
+                                num_styles=num_styles,
+                                device=q.device,
+                                # N-style 경로에서는 멀티 마스크 파일 규약이 의도이므로,
+                                # `_mask.npy`로의 silent fallback을 막아 잘못된 전체 스타일 적용을 방지합니다.
+                                allow_legacy_label_fallback=False,
+                            )
+                            if single_style_masked_mode and num_styles == 1:
+                                # single_ver1은 mask0 밖을 완전한 content 영역으로 강제하기 위해
+                                # attention 계층 해상도에서도 hard binary mask로 고정합니다.
+                                style_weight_maps = (style_weight_maps >= 0.5).to(dtype=cc_sim.dtype)
 
                         style_sims = self.apply_pi_mass_nway(
                             style_sims=style_sims,

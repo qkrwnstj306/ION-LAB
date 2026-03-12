@@ -512,6 +512,13 @@ def feat_merge_nsty_clean(opt, cnt_feats, style_feats_list, pi_style_total=0.9, 
             }
         }
 
+        # 1-style 실험은 attention 쪽에서 명시적으로 분기할 수 있도록 모드를 함께 전달합니다.
+        if num_styles == 1:
+            if getattr(opt, "single_ver1", False):
+                feat_map['config']['single_style_mode'] = 'masked'
+            elif getattr(opt, "single_ver2", False):
+                feat_map['config']['single_style_mode'] = 'global'
+
         cnt_feat = cnt_feats[i]
         style_feats_at_i = [style_feats[i] for style_feats in style_feats_list]
 
@@ -669,7 +676,12 @@ def main():
     parser.add_argument("--seed", default=22, type=int)
     parser.add_argument('--data_root', type=str, default='./data_vis')
     parser.add_argument('--meta_file', type=str, default='_dataset.txt', help='run_ori.py 전용 메타 파일 (content + N style 토큰)')
+    parser.add_argument('--single_ver1', action='store_true', help='1-style일 때 mask 영역만 [style, content]=[pi,1-pi], 나머지는 pure content')
+    parser.add_argument('--single_ver2', action='store_true', help='1-style일 때 전 영역을 [style, content]=[pi,1-pi]로 처리')
     opt = parser.parse_args()
+
+    if opt.single_ver1 and opt.single_ver2:
+        raise ValueError("--single_ver1, --single_ver2는 동시에 사용할 수 없습니다.")
 
     seed_everything(opt.seed)
     os.makedirs(opt.output_path, exist_ok=True)
@@ -743,6 +755,11 @@ def main():
         style_paths = sample_meta["style_paths"]
         if len(style_paths) < 1:
             raise ValueError(f"style path가 1개 이상이어야 합니다: {sample_meta}")
+        if (opt.single_ver1 or opt.single_ver2) and len(style_paths) != 1:
+            raise ValueError(
+                "single style 전용 플래그는 style 이미지가 정확히 1개인 샘플에서만 사용할 수 있습니다. "
+                f"현재 sample의 style 개수={len(style_paths)}"
+            )
         # 분기 기준은 해상도가 아니라 "스타일 개수"입니다.
         # - style 2개: 기존 2-style 경로(legacy) 유지
         # - 그 외(style 1개 또는 3개 이상): N-style 경로 사용
@@ -839,42 +856,72 @@ def main():
                     # 멀티 마스크 파일 규약:
                     #   content_001.png -> content_001_mask0.npy, content_001_mask1.npy, ...
                     # 메타 파일의 style 순서와 mask index를 동일하게 맞춥니다.
-                    style_mask_stack_img = load_style_mask_stack_for_runtime(
-                        cnt_path=cnt_path,
-                        target_h=opt.H,
-                        target_w=opt.W,
-                        num_styles=len(style_z_enc_list),
-                        device=device,
-                    )  # (N,1,H,W)
+                    single_style_masked_mode = (len(style_z_enc_list) == 1 and opt.single_ver1)
+                    single_style_global_mode = (len(style_z_enc_list) == 1 and opt.single_ver2)
+                    if single_style_global_mode:
+                        # single_ver2는 mask를 무시하고 전 영역을 style/content 혼합 대상으로 봅니다.
+                        style_mask_stack_img = torch.ones(
+                            (1, 1, opt.H, opt.W),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                    else:
+                        style_mask_stack_img = load_style_mask_stack_for_runtime(
+                            cnt_path=cnt_path,
+                            target_h=opt.H,
+                            target_w=opt.W,
+                            num_styles=len(style_z_enc_list),
+                            device=device,
+                        )  # (N,1,H,W)
 
-                    style_weights_latent, style_coverage_latent = build_style_weight_maps_for_latent_from_masks(
-                        style_mask_stack_img,
-                        cnt_z_enc.shape[2],
-                        cnt_z_enc.shape[3],
-                    )
-                    style_weights_latent = style_weights_latent.to(device=device, dtype=cnt_z_enc.dtype)      # (N,1,h,w)
-                    style_coverage_latent = style_coverage_latent.to(device=device, dtype=cnt_z_enc.dtype)    # (1,1,h,w)
-
-                    # content latent를 기준으로 각 style latent에 AdaIN을 적용한 뒤,
-                    # 멀티 마스크를 이용해 스타일들을 혼합합니다.
-                    # (마스크 합이 항상 1이면 coverage는 1이 되어 순수 스타일 혼합만 남습니다.)
-                    adain_components = []
                     cnt_z_enc_dev = cnt_z_enc.to(device)
-                    for style_z_enc in style_z_enc_list:
-                        adain_components.append(adain(cnt_z_enc_dev, style_z_enc.to(device)))
+                    if single_style_masked_mode:
+                        # single_ver1은 mask0 영역만 스타일 혼합 대상으로 보고,
+                        # 나머지 영역은 content latent를 그대로 유지합니다.
+                        style_mask_latent = F.interpolate(
+                            style_mask_stack_img,
+                            size=(cnt_z_enc.shape[2], cnt_z_enc.shape[3]),
+                            mode="nearest",
+                        ).to(device=device, dtype=cnt_z_enc.dtype)
+                        style_mask_latent = (style_mask_latent >= 0.5).to(dtype=cnt_z_enc.dtype)
 
-                    adain_stack = torch.stack(adain_components, dim=0)  # (N, B, C, h, w)
-                    style_weights_latent = style_weights_latent.unsqueeze(1)  # (N,1,1,h,w)
-                    style_coverage_latent = style_coverage_latent.unsqueeze(1)  # (1,1,1,h,w)
+                        styled_latent = adain(cnt_z_enc_dev, style_z_enc_list[0].to(device))
+                        adain_z_enc = (
+                            styled_latent * style_mask_latent +
+                            cnt_z_enc_dev * (1.0 - style_mask_latent)
+                        ).clone().detach()
 
-                    styled_latent = (style_weights_latent * adain_stack).sum(dim=0)
-                    adain_z_enc = (
-                        styled_latent * style_coverage_latent.squeeze(0) +
-                        cnt_z_enc_dev * (1.0 - style_coverage_latent.squeeze(0))
-                    ).clone().detach()
+                        del style_mask_latent, styled_latent, cnt_z_enc_dev
+                    else:
+                        style_weights_latent, style_coverage_latent = build_style_weight_maps_for_latent_from_masks(
+                            style_mask_stack_img,
+                            cnt_z_enc.shape[2],
+                            cnt_z_enc.shape[3],
+                        )
+                        style_weights_latent = style_weights_latent.to(device=device, dtype=cnt_z_enc.dtype)      # (N,1,h,w)
+                        style_coverage_latent = style_coverage_latent.to(device=device, dtype=cnt_z_enc.dtype)    # (1,1,h,w)
 
-                    del style_mask_stack_img, style_weights_latent, style_coverage_latent
-                    del adain_components, adain_stack, styled_latent, cnt_z_enc_dev
+                        # content latent를 기준으로 각 style latent에 AdaIN을 적용한 뒤,
+                        # 멀티 마스크를 이용해 스타일들을 혼합합니다.
+                        # (마스크 합이 항상 1이면 coverage는 1이 되어 순수 스타일 혼합만 남습니다.)
+                        adain_components = []
+                        for style_z_enc in style_z_enc_list:
+                            adain_components.append(adain(cnt_z_enc_dev, style_z_enc.to(device)))
+
+                        adain_stack = torch.stack(adain_components, dim=0)  # (N, B, C, h, w)
+                        style_weights_latent = style_weights_latent.unsqueeze(1)  # (N,1,1,h,w)
+                        style_coverage_latent = style_coverage_latent.unsqueeze(1)  # (1,1,1,h,w)
+
+                        styled_latent = (style_weights_latent * adain_stack).sum(dim=0)
+                        adain_z_enc = (
+                            styled_latent * style_coverage_latent.squeeze(0) +
+                            cnt_z_enc_dev * (1.0 - style_coverage_latent.squeeze(0))
+                        ).clone().detach()
+
+                        del style_weights_latent, style_coverage_latent
+                        del adain_components, adain_stack, styled_latent, cnt_z_enc_dev
+
+                    del style_mask_stack_img
                     torch.cuda.empty_cache()
             
             # z_enc 삭제
